@@ -8,26 +8,34 @@ from bot_core import bot, dp, WEBHOOK_PATH, WEBHOOK_URL
 
 app = Flask(__name__)
 
+# Флаг, чтобы не дергать set_webhook слишком часто
+webhook_set = False
+
+
+async def ensure_webhook():
+    """
+    Гарантирует, что webhook один раз установлен.
+    Если что — повторный вызов не страшен, Telegram перезапишет URL.
+    """
+    global webhook_set
+    if webhook_set:
+        return
+    await bot.set_webhook(WEBHOOK_URL)
+    webhook_set = True
+
 
 @app.route("/", methods=["GET"])
 def index():
+    # При первом заходе на корень выставляем webhook
+    asyncio.run(ensure_webhook())
     return "Telegram bot is running."
-
-
-@app.before_first_request
-def on_startup():
-    """
-    При первом запросе (например, когда ты откроешь сайт в браузере)
-    выставляем webhook для Telegram.
-    """
-    asyncio.run(bot.set_webhook(WEBHOOK_URL))
 
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
-    """
-    Сюда Telegram будет слать обновления.
-    """
+    # На всякий случай гарантируем, что webhook установлен
+    asyncio.run(ensure_webhook())
+
     json_data = request.get_json(force=True)
     update = Update.model_validate(json_data)
     asyncio.run(dp.feed_update(bot, update))
@@ -35,5 +43,5 @@ def telegram_webhook():
 
 
 if __name__ == "__main__":
-    # Локальный запуск (для отладки, не обязателен)
+    # Локальный запуск (для отладки, не обязателен на Render)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
