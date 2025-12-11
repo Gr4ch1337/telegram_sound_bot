@@ -1,0 +1,4 @@
+aiogram==3.23.0
+openpyxl
+flask
+gunicorn
