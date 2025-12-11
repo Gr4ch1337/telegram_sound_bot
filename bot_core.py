@@ -24,36 +24,39 @@ from openpyxl import Workbook
 
 # =============== НАСТРОЙКИ ===============
 
-# Токен читаем из переменной окружения BOT_TOKEN (на Render мы её зададим)
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
 
 DB_PATH = "tickets.db"
 
-# Ограничение доступа к отчётам (если нужно — впиши сюда ID)
+# ID общего чата для уведомлений о новых обращениях.
+# В Render нужно добавить переменную окружения GROUP_CHAT_ID (например, -1001234567890).
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
+
+# Ограничение доступа к отчётам (если нужно — впиши сюда свой ID)
 ADMIN_IDS: list[int] = []  # пример: [123456789]
 
-# WEBHOOK_PATH: уникальный путь, зависящий от токена
 WEBHOOK_PATH = f"/webhook/{API_TOKEN}"
 
-# На Render будет переменная RENDER_EXTERNAL_URL с полным URL сервиса
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
 WEBHOOK_URL = BASE_URL.rstrip("/") + WEBHOOK_PATH
 
 
 # =============== КОНСТАНТЫ ===============
 
+# Список сотрудников (алфавитный, "Петрова" убрана, "Зарубин" и "Змеев" добавлены)
 EMPLOYEES = [
-    "Казаченкова",
-    "Гвоздева",
     "Богданов",
-    "Петрова",
+    "Гвоздева",
+    "Зарубин",
+    "Змеев",
+    "Иванов",
+    "Казаченкова",
+    "Климентьев",
     "Кожин",
     "Курланов",
     "Салакаев",
-    "Климентьев",
-    "Иванов",
     "Трембицкий",
 ]
 
@@ -142,7 +145,7 @@ def init_db() -> None:
     conn.close()
 
 
-def insert_ticket(ticket: dict) -> None:
+def insert_ticket(ticket: dict) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -166,8 +169,10 @@ def insert_ticket(ticket: dict) -> None:
             ticket.get("cause"),
         ),
     )
+    ticket_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return ticket_id
 
 
 def get_tickets(filter_date: str | None = None, filter_play: str | None = None):
@@ -211,9 +216,6 @@ def get_tickets(filter_date: str | None = None, filter_play: str | None = None):
 
 
 def get_tickets_by_month(year_month: str):
-    """
-    year_month: строка вида 'YYYY-MM'
-    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -245,6 +247,7 @@ def get_tickets_by_month(year_month: str):
 def build_employees_keyboard(selected: list[int]) -> InlineKeyboardMarkup:
     """
     Мультивыбор сотрудников: отмеченные помечаются ✅.
+    Список EMPLOYEES уже алфавитный.
     """
     buttons: list[list[InlineKeyboardButton]] = []
 
@@ -262,9 +265,6 @@ def build_employees_keyboard(selected: list[int]) -> InlineKeyboardMarkup:
 
 
 def build_venue_keyboard() -> InlineKeyboardMarkup:
-    """
-    Инлайн-клавиатура для выбора площадки.
-    """
     rows: list[list[InlineKeyboardButton]] = []
     for v in VENUES:
         rows.append(
@@ -312,7 +312,7 @@ def build_report_plays_keyboard() -> InlineKeyboardMarkup:
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
     """
-    Reply-клавиатура, которая всегда снизу.
+    Главное меню снизу.
     """
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -325,12 +325,31 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def build_context_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Клавиатура для внутренних шагов:
+    только «Назад» и «Главное меню».
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="⬅️ Назад"),
+                KeyboardButton(text="🏠 Главное меню"),
+            ]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 def build_calendar(year: int | None = None, month: int | None = None) -> InlineKeyboardMarkup:
     """
     Инлайн-календарь для выбора даты.
+    Нельзя выбирать будущие даты (только сегодня и раньше).
     """
+    today = date.today()
+
     if year is None or month is None:
-        today = date.today()
         year, month = today.year, today.month
 
     kb: list[list[InlineKeyboardButton]] = []
@@ -351,12 +370,17 @@ def build_calendar(year: int | None = None, month: int | None = None) -> InlineK
                 row.append(InlineKeyboardButton(text=" ", callback_data="CAL:IGNORE"))
             else:
                 day_str = f"{day_:02d}"
-                month_str = f"{month:02d}"
-                callback = f"CAL:DAY:{year}-{month_str}-{day_str}"
-                row.append(InlineKeyboardButton(text=day_str, callback_data=callback))
+                day_date = date(year, month, day_)
+                if day_date > today:
+                    # Будущее — делаем неактивной клеткой
+                    row.append(InlineKeyboardButton(text=day_str, callback_data="CAL:IGNORE"))
+                else:
+                    month_str = f"{month:02d}"
+                    callback = f"CAL:DAY:{year}-{month_str}-{day_str}"
+                    row.append(InlineKeyboardButton(text=day_str, callback_data=callback))
         kb.append(row)
 
-    # Навигация
+    # Навигация по месяцам
     if month == 1:
         prev_month = 12
         prev_year = year - 1
@@ -484,9 +508,14 @@ async def new_ticket_message(message: Message, state: FSMContext):
     await state.set_state(Form.employees)
     await state.update_data(selected_employees_idx=[])
 
+    # Включаем контекстную клавиатуру (Назад + Главное меню)
+    await message.answer(
+        "Начинаем новое обращение.",
+        reply_markup=build_context_keyboard(),
+    )
+
     kb = build_employees_keyboard(selected=[])
     await message.answer(
-        "Начинаем новое обращение.\n\n"
         "1. Выберите сотрудника/ов (можно несколько):",
         reply_markup=kb,
     )
@@ -498,6 +527,118 @@ async def main_menu_message(message: Message, state: FSMContext):
 
 async def report_button_message(message: Message, state: FSMContext):
     await cmd_menu(message)
+
+
+async def back_message(message: Message, state: FSMContext):
+    """
+    Кнопка «⬅️ Назад» — возвращает на предыдущий шаг.
+    """
+    current = await state.get_state()
+
+    # Если нет активного состояния — «Назад» ведёт в главное меню
+    if not current:
+        await cmd_start(message, state)
+        return
+
+    # ===== ОБРАЩЕНИЯ =====
+    if current == Form.employees.state:
+        # Отмена создания обращения -> главное меню
+        await state.clear()
+        await cmd_start(message, state)
+        return
+
+    if current == Form.date.state:
+        # Назад к выбору сотрудников
+        data = await state.get_data()
+        selected = data.get("selected_employees_idx", [])
+        await state.set_state(Form.employees)
+
+        await message.answer(
+            "1. Выберите сотрудника/ов (можно несколько):",
+            reply_markup=build_context_keyboard(),
+        )
+        kb = build_employees_keyboard(selected)
+        await message.answer(
+            "Текущий выбор сотрудников:",
+            reply_markup=kb,
+        )
+        return
+
+    if current == Form.venue.state:
+        # Назад к выбору даты
+        data = await state.get_data()
+        stored_date = data.get("date")
+        await state.set_state(Form.date)
+
+        if stored_date:
+            year, month, day = map(int, stored_date.split("-"))
+            cal = build_calendar(year, month)
+        else:
+            cal = build_calendar()
+
+        await message.answer(
+            "2. Выберите дату из календаря:",
+            reply_markup=build_context_keyboard(),
+        )
+        await message.answer(
+            "Календарь:",
+            reply_markup=cal,
+        )
+        return
+
+    if current == Form.play.state:
+        # Назад к выбору площадки
+        data = await state.get_data()
+        await state.set_state(Form.venue)
+
+        await message.answer(
+            "3. Выберите площадку:",
+            reply_markup=build_context_keyboard(),
+        )
+        await message.answer(
+            "Площадки:",
+            reply_markup=build_venue_keyboard(),
+        )
+        return
+
+    if current == Form.problem.state:
+        # Назад к выбору спектакля
+        data = await state.get_data()
+        venue = data.get("venue", "Бронная")
+
+        await state.set_state(Form.play)
+
+        await message.answer(
+            "4. Выберите спектакль:",
+            reply_markup=build_context_keyboard(),
+        )
+        kb = build_plays_keyboard(venue)
+        await message.answer(
+            f"Текущая площадка: {venue}",
+            reply_markup=kb,
+        )
+        return
+
+    if current == Form.cause.state:
+        # Назад к вводу проблемы
+        await state.set_state(Form.problem)
+        # Очищать старый текст проблемы не обязательно, можно перезаписать
+        await message.answer(
+            "5. Опишите проблему (текстом):",
+            reply_markup=build_context_keyboard(),
+        )
+        return
+
+    # ===== ОТЧЁТЫ =====
+    if current == Report.date.state or current == Report.month.state:
+        # Назад из выбора даты/месяца -> в меню отчётов
+        await state.clear()
+        await cmd_menu(message)
+        return
+
+    # На всякий случай: если состояние неизвестно — в главное меню
+    await state.clear()
+    await cmd_start(message, state)
 
 
 # --- Сотрудники ---
@@ -519,7 +660,11 @@ async def employees_callback(call: CallbackQuery, state: FSMContext):
         cal = build_calendar()
         await call.message.answer(
             "2. Выберите дату из календаря:",
-            reply_markup=cal
+            reply_markup=build_context_keyboard(),
+        )
+        await call.message.answer(
+            "Календарь:",
+            reply_markup=cal,
         )
         return
 
@@ -556,6 +701,10 @@ async def calendar_form_callback(call: CallbackQuery, state: FSMContext):
         await call.message.answer(
             f"Вы выбрали дату: {date_str}\n\n"
             "3. Выберите площадку:",
+            reply_markup=build_context_keyboard(),
+        )
+        await call.message.answer(
+            "Площадки:",
             reply_markup=build_venue_keyboard(),
         )
         await call.answer()
@@ -587,7 +736,11 @@ async def venue_callback(call: CallbackQuery, state: FSMContext):
     kb = build_plays_keyboard(venue)
     await call.message.answer(
         "4. Выберите спектакль:",
-        reply_markup=kb
+        reply_markup=build_context_keyboard(),
+    )
+    await call.message.answer(
+        f"Площадка: {venue}",
+        reply_markup=kb,
     )
 
 
@@ -617,7 +770,7 @@ async def play_callback(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         f"Вы выбрали спектакль: {play_name}\n\n"
         "5. Опишите проблему (текстом):",
-        reply_markup=None
+        reply_markup=build_context_keyboard(),
     )
 
 
@@ -631,7 +784,10 @@ async def problem_entered(message: Message, state: FSMContext):
     )
     await state.set_state(Form.cause)
 
-    await message.answer("6. Предполагаемая причина проблемы (текстом):")
+    await message.answer(
+        "6. Предполагаемая причина проблемы (текстом):",
+        reply_markup=build_context_keyboard(),
+    )
 
 
 # --- Причина + сохранение тикета ---
@@ -652,11 +808,12 @@ async def cause_entered(message: Message, state: FSMContext):
         "cause": cause_text,
     }
 
-    insert_ticket(ticket)
+    ticket_id = insert_ticket(ticket)
 
-    # Удаляем сообщения с проблемой и причиной, чтобы не висели простыни
     bot_obj = message.bot
     problem_msg_id = data.get("problem_msg_id")
+
+    # Пытаемся очистить "промежуточный" мусор
     try:
         await bot_obj.delete_message(chat_id=message.chat.id, message_id=message.message_id)
     except Exception:
@@ -671,7 +828,8 @@ async def cause_entered(message: Message, state: FSMContext):
 
     employees_str = ", ".join(ticket["employees"])
     text = (
-        "Обращение сохранено ✅\n\n"
+        "Обращение сохранено ✅\n"
+        f"Номер: {ticket_id}\n\n"
         f"Сотрудники: {employees_str}\n"
         f"Дата: {ticket['date']}\n"
         f"Площадка: {ticket['venue']}\n"
@@ -680,8 +838,29 @@ async def cause_entered(message: Message, state: FSMContext):
         f"Причина: {ticket['cause']}\n"
     )
 
-    kb = build_main_keyboard()
-    await message.answer(text, reply_markup=kb)
+    # Отправка пользователю + возврат в главное меню
+    kb_main = build_main_keyboard()
+    await message.answer(text, reply_markup=kb_main)
+
+    # Отправка в общий чат, если задан GROUP_CHAT_ID
+    if GROUP_CHAT_ID != 0:
+        try:
+            username = ticket["username"] or "без username"
+            group_text = (
+                "Новое обращение ❗️\n"
+                f"Номер: {ticket_id}\n"
+                f"От: @{username} (id {ticket['user_id']})\n\n"
+                f"Сотрудники: {employees_str}\n"
+                f"Дата: {ticket['date']}\n"
+                f"Площадка: {ticket['venue']}\n"
+                f"Спектакль: {ticket['play']}\n"
+                f"Проблема: {ticket['problem']}\n"
+                f"Причина: {ticket['cause']}\n"
+            )
+            await bot_obj.send_message(chat_id=GROUP_CHAT_ID, text=group_text)
+        except Exception:
+            # Не ломаем бота, если что-то не так с чатом
+            pass
 
 
 # --- Команды отчётов ---
@@ -730,13 +909,13 @@ async def cmd_menu(message: Message):
         await message.answer("У вас нет прав для просмотра отчётов.")
         return
 
+    await message.answer(
+        "Меню отчётов:",
+        reply_markup=build_context_keyboard(),
+    )
     kb = build_report_menu_keyboard()
     await message.answer(
-        "Меню отчётов:\n"
-        "— Все обращения\n"
-        "— По дате\n"
-        "— По спектаклю\n"
-        "— По месяцу",
+        "Выберите тип отчёта:",
         reply_markup=kb,
     )
 
@@ -759,7 +938,11 @@ async def report_menu_callback(call: CallbackQuery, state: FSMContext):
         cal = build_calendar()
         await call.message.answer(
             "Выберите дату для отчёта:",
-            reply_markup=cal
+            reply_markup=build_context_keyboard(),
+        )
+        await call.message.answer(
+            "Календарь:",
+            reply_markup=cal,
         )
         await call.answer()
         return
@@ -768,7 +951,11 @@ async def report_menu_callback(call: CallbackQuery, state: FSMContext):
         kb = build_report_plays_keyboard()
         await call.message.answer(
             "Выберите спектакль для отчёта:",
-            reply_markup=kb
+            reply_markup=build_context_keyboard(),
+        )
+        await call.message.answer(
+            "Список спектаклей:",
+            reply_markup=kb,
         )
         await call.answer()
         return
@@ -779,7 +966,11 @@ async def report_menu_callback(call: CallbackQuery, state: FSMContext):
         kb = build_month_keyboard(this_year)
         await call.message.answer(
             "Выберите год и месяц для отчёта:",
-            reply_markup=kb
+            reply_markup=build_context_keyboard(),
+        )
+        await call.message.answer(
+            "Календарь месяцев:",
+            reply_markup=kb,
         )
         await call.answer()
         return
@@ -887,8 +1078,9 @@ dp.message.register(cmd_menu, Command("menu", "reports_menu", "reports"))
 dp.message.register(new_ticket_message, F.text == "🚨 Хьюстон, у нас проблемы")
 dp.message.register(report_button_message, F.text == "📊 Отчёт")
 dp.message.register(main_menu_message, F.text == "🏠 Главное меню")
+dp.message.register(back_message, F.text == "⬅️ Назад")
 
-# Опрос
+# Опрос (форма обращения)
 dp.callback_query.register(employees_callback, Form.employees, F.data.startswith("EMP"))
 dp.callback_query.register(calendar_form_callback, Form.date, F.data.startswith("CAL"))
 dp.callback_query.register(venue_callback, Form.venue, F.data.startswith("VENUE:"))
