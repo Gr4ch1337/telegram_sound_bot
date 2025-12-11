@@ -8,14 +8,17 @@ from bot_core import bot, dp, WEBHOOK_PATH, WEBHOOK_URL
 
 app = Flask(__name__)
 
-# Флаг, чтобы не дергать set_webhook слишком часто
+# Глобальный event loop для всего приложения
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+# Флаг, чтобы не дёргать set_webhook лишний раз
 webhook_set = False
 
 
 async def ensure_webhook():
     """
     Гарантирует, что webhook один раз установлен.
-    Если что — повторный вызов не страшен, Telegram перезапишет URL.
     """
     global webhook_set
     if webhook_set:
@@ -24,24 +27,29 @@ async def ensure_webhook():
     webhook_set = True
 
 
+async def process_update(update: Update):
+    """
+    Обработка апдейта от Telegram.
+    """
+    await ensure_webhook()
+    await dp.feed_update(bot, update)
+
+
 @app.route("/", methods=["GET"])
 def index():
     # При первом заходе на корень выставляем webhook
-    asyncio.run(ensure_webhook())
+    loop.run_until_complete(ensure_webhook())
     return "Telegram bot is running."
 
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
-    # На всякий случай гарантируем, что webhook установлен
-    asyncio.run(ensure_webhook())
-
     json_data = request.get_json(force=True)
     update = Update.model_validate(json_data)
-    asyncio.run(dp.feed_update(bot, update))
+    loop.run_until_complete(process_update(update))
     return "OK"
 
 
 if __name__ == "__main__":
-    # Локальный запуск (для отладки, не обязателен на Render)
+    # Локальный запуск (для отладки)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
